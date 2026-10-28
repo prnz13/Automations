@@ -1,0 +1,33 @@
+# The name of the workflow as it will appear in the GitHub Actions tab
+name: Deployments
+
+# Define the events that trigger this workflow
+on:
+  push:
+    branches: [ "main" ]
+
+# A workflow run is made up of one or more jobs
+jobs:
+  build-and-run:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Step 1: Check out the repository code onto the runner
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      # Step 2: Set up a runtime environment (e.g., Node.js)
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Step 3: Install project dependencies
+      - name: Install dependencies
+        run: npm install
+
+      # Step 4: Run your tests or build commands
+      - name: Run tests
+        run: npm test
