@@ -1,0 +1,25 @@
+
+services:
+  ai_exe_sad_v5.0.1.1.2:
+    image: vgvalcontainer.azurecr.io/execution-assisstant-api:2.0.7
+    container_name: ai_exe_sad-v5.0.1.1.2
+    platform: linux/amd64
+    env_file:
+      - ./.env
+    volumes:
+      - /AI-DATA:/mnt
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "200m"
+        max-file: "5"
+    networks:
+      - ai_net
+
+
+networks:
+  ai_net:
+    name: ai_net
+    external: true
