@@ -1,0 +1,65 @@
+services:
+  ai_sga_v5.0.1.1.2:
+    image: vgvalcontainer.azurecr.io/sga-api:2.0.33
+    container_name: ai_sga-v5.0.1.1.2
+    platform: linux/amd64
+    env_file:
+      - ./.env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /AI-DATA:/mnt
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "200m"
+        max-file: "5"
+    networks:
+      - ai_net
+  ai_sga_celery_v5.0.1.1.2:
+    image: vgvalcontainer.azurecr.io/sga-api:2.0.33
+    container_name: ai_sga-celery-v5.0.1.1.2
+    platform: linux/amd64
+    env_file:
+      - ./.env
+    environment:
+      - CELERY_CONCURRENCY=2
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /AI-DATA:/mnt
+    entrypoint:
+      - /bin/sh
+      - -c
+    command:
+      - >
+        set -e;
+        Q="$$(python -c 'from sga.utils.queue_names import worker_queues_for_boot; print(worker_queues_for_boot())')";
+        echo "Worker subscribing to: $$Q";
+        exec celery -A sga.sga_capp.celery_app worker
+        --loglevel=info
+        --concurrency="$${CELERY_CONCURRENCY:-2}"
+        --pool=prefork
+        --max-tasks-per-child=100
+        --without-gossip
+        --without-mingle
+        -Q "$$Q"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "200m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 3G
+        reservations:
+          cpus: '1'
+          memory: 2G
+    networks:
+      - ai_net
+networks:
+  ai_net:
+    name: ai_net
+    external: true
