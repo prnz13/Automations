@@ -1,35 +1,123 @@
-name: Deploy AI Services
+name: Deploy VLMS to Azure Ubuntu
 
 on:
   workflow_dispatch:
-    inputs:
-      environment:
-        description: Select environment
-        required: true
-        type: choice
-        options:
-          - dev
-          - val
-          - prd
 
 permissions:
   contents: read
 
 concurrency:
-  group: ai-deploy-${{ inputs.environment }}
+  group: vlms-azure-v50112
   cancel-in-progress: false
 
-# A workflow run is made up of one or more jobs
-
 jobs:
-  build-and-run:
-    # The type of runner that the job will run on
+  deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
-
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_USER: vgadmin
+      ACR_NAME: ${{ secrets.ACR_NAME }}
+      SOURCE_DIR: deployments/v5.0.1.1.2
+      DEPLOY_DIR: /home/vgadmin/VLMS/v5.0.1.1.2
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Deployment steps described below go here.
+      - name: Validate deployment files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d "$SOURCE_DIR"
+          test -f "$SOURCE_DIR/start.sh"
+
+          # Prevent unsafe values from entering remote shell commands.
+          [[ "$ACR_NAME" =~ ^[a-zA-Z0-9]+$ ]]
+          [[ "$SSH_PORT" =~ ^[0-9]+$ ]]
+
+      - name: Configure SSH
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+
+          cat > "$HOME/.ssh/config" <<EOF
+          Host vlms-target
+            HostName $SSH_HOST
+            User $SSH_USER
+            Port $SSH_PORT
+            IdentityFile $HOME/.ssh/deploy_key
+            IdentitiesOnly yes
+            BatchMode yes
+            StrictHostKeyChecking yes
+          EOF
+
+      - name: Check server prerequisites and create directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh vlms-target 'bash -se' <<'REMOTE'
+          set -euo pipefail
+
+          command -v az >/dev/null
+          command -v docker >/dev/null
+          command -v rsync >/dev/null
+
+          docker compose version
+          docker info >/dev/null
+
+          mkdir -p /home/vgadmin/VLMS/v5.0.1.1.2
+          REMOTE
+
+      - name: Copy deployment files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rsync -az \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            "$SOURCE_DIR/" \
+            "vlms-target:$DEPLOY_DIR/"
+
+      - name: Authenticate and start deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh vlms-target "bash -se -- '$ACR_NAME'" <<'REMOTE'
+          set -euo pipefail
+
+          ACR_NAME="$1"
+          cd /home/vgadmin/VLMS/v5.0.1.1.2
+
+          # Make all deployment shell scripts executable.
+          find . -type f -name '*.sh' -exec chmod +x {} +
+
+          # Authenticate on the Azure VM using its managed identity.
+          az login --identity --output none
+          az acr login --name "$ACR_NAME"
+
+          # Run in the deployment directory.
+          ./start.sh
+          REMOTE
+
+      - name: Remove SSH credentials from runner
+        if: always()
+        shell: bash
+        run: |
+          rm -f "$HOME/.ssh/deploy_key" \
+                "$HOME/.ssh/config" \
+                "$HOME/.ssh/known_hosts"
