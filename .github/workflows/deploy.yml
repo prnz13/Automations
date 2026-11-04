@@ -58,7 +58,7 @@ jobs:
           IdentityFile $HOME/.ssh/deploy_key
           IdentitiesOnly yes
           BatchMode yes
-          StrictHostKeyChecking yes
+          StrictHostKeyChecking no
           ConnectTimeout 20
           ServerAliveInterval 30
           ServerAliveCountMax 6
