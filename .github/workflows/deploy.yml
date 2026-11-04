@@ -33,10 +33,10 @@ jobs:
         [[ "$SSH_PORT" =~ ^[0-9]{1,5}$ ]]
         (( 10#$SSH_PORT >= 1 && 10#$SSH_PORT <= 65535 ))
         [[ "$ACR_NAME" =~ ^[a-zA-Z0-9]+$ ]]
-        for file in start.sh content-generation-docker-compose.yaml execution-assisstant-docker-compose.yaml ingestion-docker-compose.yaml sga-docker-compose.yaml smart-generation-docker-compose.yaml; do
+        for file in ai-start.sh content-generation-docker-compose.yaml execution-assisstant-docker-compose.yaml ingestion-docker-compose.yaml sga-docker-compose.yaml smart-generation-docker-compose.yaml; do
           test -f "$SOURCE_DIR/$file" || { echo "Missing: $SOURCE_DIR/$file"; exit 1; }
         done
-        bash -n "$SOURCE_DIR/start.sh"
+        bash -n "$SOURCE_DIR/ai-start.sh"
     - name: Configure SSH
       shell: bash
       env:
@@ -159,7 +159,7 @@ jobs:
 
         test -s .env
         find . -type f -name '*.sh' -exec chmod +x {} +
-        bash -n start.sh
+        bash -n ai-start.sh
         az login --identity --output none
         az acr login --name "$1"
 
@@ -169,7 +169,7 @@ jobs:
         for i in "${!files[@]}"; do
           docker compose --env-file .env -p "${projects[$i]}" -f "${files[$i]}" config --quiet
         done
-        ./start.sh
+        ./ai-start.sh
 
         # Check API containers AND background workers, using one bounded retry window.
         containers=(
