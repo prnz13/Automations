@@ -1,123 +1,325 @@
+# Preserve the supplied /v50112/ locations and upstream names.
+# Readiness URLs intentionally retain the supplied dotted version paths.
+# DronaAKS is not included: its Compose file has not been supplied.
 name: Deploy VLMS to Azure Ubuntu
-
-on:
-  workflow_dispatch:
-
+'on':
+  workflow_dispatch: null
 permissions:
   contents: read
-
 concurrency:
   group: vlms-azure-v50112
   cancel-in-progress: false
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-
     env:
       SSH_HOST: ${{ secrets.SSH_HOST }}
-      SSH_PORT: ${{ secrets.SSH_PORT }}
-      SSH_USER: vgadmin
+      SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
       ACR_NAME: ${{ secrets.ACR_NAME }}
       SOURCE_DIR: deployments/v5.0.1.1.2
       DEPLOY_DIR: /home/vgadmin/VLMS/v5.0.1.1.2
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Validate files and settings
+      shell: bash
+      run: |
+        set -euo pipefail
+        for name in SSH_HOST SSH_PORT ACR_NAME; do
+          test -n "${!name}" || { echo "Missing setting: $name"; exit 1; }
+        done
+        [[ "$SSH_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]]
+        [[ "$SSH_PORT" =~ ^[0-9]{1,5}$ ]]
+        (( 10#$SSH_PORT >= 1 && 10#$SSH_PORT <= 65535 ))
+        [[ "$ACR_NAME" =~ ^[a-zA-Z0-9]+$ ]]
+        for file in start.sh content-generation-docker-compose.yaml execution-assisstant-docker-compose.yaml ingestion-docker-compose.yaml sga-docker-compose.yaml smart-generation-docker-compose.yaml; do
+          test -f "$SOURCE_DIR/$file" || { echo "Missing: $SOURCE_DIR/$file"; exit 1; }
+        done
+        bash -n "$SOURCE_DIR/start.sh"
+    - name: Configure SSH
+      shell: bash
+      env:
+        SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+      run: |
+        set -euo pipefail
+        umask 077
+        test -n "$SSH_PRIVATE_KEY" || { echo 'Missing SSH_PRIVATE_KEY'; exit 1; }
+        test -n "$SSH_KNOWN_HOSTS" || { echo 'Missing SSH_KNOWN_HOSTS'; exit 1; }
+        mkdir -p "$HOME/.ssh"
+        printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/deploy_key"
+        printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+        cat > "$HOME/.ssh/config" <<EOF
+        Host vlms-target
+          HostName $SSH_HOST
+          User vgadmin
+          Port $SSH_PORT
+          IdentityFile $HOME/.ssh/deploy_key
+          IdentitiesOnly yes
+          BatchMode yes
+          StrictHostKeyChecking yes
+          ConnectTimeout 20
+          ServerAliveInterval 30
+          ServerAliveCountMax 6
+        EOF
+    - name: Check server prerequisites
+      shell: bash
+      run: |
+        set -euo pipefail
+        ssh vlms-target 'bash -se' <<'REMOTE'
+        set -euo pipefail
+        for executable in az docker rsync python3 curl flock; do
+          command -v "$executable" >/dev/null || { echo "Missing executable: $executable"; exit 1; }
+        done
+        docker compose version
+        docker info >/dev/null
+        docker network inspect ai_net >/dev/null
+        test -d /AI-DATA
+        test -f /home/vgadmin/Common-AI/nginx/nginx.conf
+        test -w /home/vgadmin/Common-AI/nginx/nginx.conf
+        [ "$(docker inspect --format '{{.State.Running}}' ai_nginx)" = true ]
+        docker inspect --format '{{json .NetworkSettings.Networks}}' ai_nginx |
+          python3 -c 'import json,sys; assert "ai_net" in json.load(sys.stdin), "ai_nginx must be connected to ai_net"'
+        docker exec ai_nginx nginx -t
+        mkdir -p /home/vgadmin/VLMS/v5.0.1.1.2
+        REMOTE
+    - name: Copy deployment files
+      shell: bash
+      run: |
+        set -euo pipefail
+        rsync -az --exclude='.env' --exclude='.env.*' \
+          "$SOURCE_DIR/" "vlms-target:$DEPLOY_DIR/"
+    - name: Create .env from GitHub Secrets
+      shell: bash
+      env:
+        ENV_CONTENT: ${{ secrets.VLMS_ENV_FILE }}
+      run: |
+        set -euo pipefail
+        test -n "$ENV_CONTENT" || { echo "Missing VLMS_ENV_FILE secret"; exit 1; }
+        printf '%s\n' "$ENV_CONTENT" |
+          ssh vlms-target 'python3 -c '"'"'import os, sys, tempfile
+        from pathlib import Path
+        os.umask(0o077)
+        target = Path("/home/vgadmin/VLMS/v5.0.1.1.2/.env")
+        data = sys.stdin.buffer.read()
+        if not data.strip():
+            raise SystemExit("Empty .env")
+        fd, temporary = tempfile.mkstemp(prefix=".env.", dir=target.parent)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, target)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        '"'"''
+        echo '.env transferred with permissions 600.'
+    - name: Deploy, update Nginx, and verify readiness
+      shell: bash
+      run: |
+        set -euo pipefail
+        # ACR_NAME was validated before it is passed to the remote shell.
+        ssh vlms-target "bash -se -- '$ACR_NAME'" <<'REMOTE'
+        set -Eeuo pipefail
+        umask 077
+        cd /home/vgadmin/VLMS/v5.0.1.1.2
+        exec 9>.deployment.lock
+        flock -n 9 || { echo 'Another deployment is active.'; exit 1; }
 
-      - name: Validate deployment files
-        shell: bash
-        run: |
-          set -euo pipefail
+        NGINX_CONTAINER=ai_nginx
+        NGINX_CONF=/home/vgadmin/Common-AI/nginx/nginx.conf
+        backup="${NGINX_CONF}.backup.$(date -u +%Y%m%dT%H%M%SZ).$$"
+        candidate=$(mktemp)
+        changed=false
 
-          test -d "$SOURCE_DIR"
-          test -f "$SOURCE_DIR/start.sh"
+        cleanup() { rm -f "$candidate"; }
+        recover() {
+          result=$?
+          trap - ERR
+          if "$changed"; then
+            echo 'Deployment failed. Restoring previous Nginx configuration.'
+            # Write in place: this configuration is a single-file bind mount.
+            if cat "$backup" > "$NGINX_CONF"; then
+              if docker restart "$NGINX_CONTAINER" >/dev/null; then
+                echo 'Previous Nginx configuration restored and restart requested.'
+              else
+                echo "ERROR: Nginx recovery restart failed. Backup: $backup"
+              fi
+            else
+              echo "ERROR: Cannot restore Nginx configuration. Backup: $backup"
+            fi
+          fi
+          echo 'Application containers and .env are not rolled back.'
+          exit "$result"
+        }
+        trap cleanup EXIT
+        trap recover ERR
 
-          # Prevent unsafe values from entering remote shell commands.
-          [[ "$ACR_NAME" =~ ^[a-zA-Z0-9]+$ ]]
-          [[ "$SSH_PORT" =~ ^[0-9]+$ ]]
+        test -s .env
+        find . -type f -name '*.sh' -exec chmod +x {} +
+        bash -n start.sh
+        az login --identity --output none
+        az acr login --name "$1"
 
-      - name: Configure SSH
-        shell: bash
-        env:
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
-        run: |
-          set -euo pipefail
-          umask 077
+        # Validate every Compose file before any service is started.
+        projects=(ai-service-cg-v50112 ai-service-ea-v50112 ai-service-ing-v50112 ai-service-sga-v50112 ai-service-sg-v50112)
+        files=(content-generation-docker-compose.yaml execution-assisstant-docker-compose.yaml ingestion-docker-compose.yaml sga-docker-compose.yaml smart-generation-docker-compose.yaml)
+        for i in "${!files[@]}"; do
+          docker compose --env-file .env -p "${projects[$i]}" -f "${files[$i]}" config --quiet
+        done
+        ./start.sh
 
-          mkdir -p "$HOME/.ssh"
-          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/deploy_key"
-          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+        # Check API containers AND background workers, using one bounded retry window.
+        containers=(
+          ai_content_generation-v5.0.1.1.2
+          ai_exe_sad-v5.0.1.1.2
+          ai_ingestion-v5.0.1.1.2
+          ai_sga-v5.0.1.1.2
+          ai_sga-celery-v5.0.1.1.2
+          ai_smart_generation-v5.0.1.1.2
+          ai_smart_generation_worker-v5.0.1.1.2
+        )
+        all_ready=false
+        for attempt in {1..30}; do
+          all_ready=true
+          for container in "${containers[@]}"; do
+            status=$(docker inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}not-configured{{end}}' "$container" 2>/dev/null) || status=missing
+            case "$status" in
+              'running|healthy'|'running|not-configured') ;;
+              *) all_ready=false ;;
+            esac
+          done
+          if "$all_ready"; then break; fi
+          sleep 5
+        done
+        for container in "${containers[@]}"; do
+          docker inspect --format '{{.Name}}: {{.State.Status}}; health={{if .State.Health}}{{.State.Health.Status}}{{else}}not-configured{{end}}' "$container" || true
+        done
+        "$all_ready" || { echo 'Container startup/health checks failed.'; false; }
 
-          cat > "$HOME/.ssh/config" <<EOF
-          Host vlms-target
-            HostName $SSH_HOST
-            User $SSH_USER
-            Port $SSH_PORT
-            IdentityFile $HOME/.ssh/deploy_key
-            IdentitiesOnly yes
-            BatchMode yes
-            StrictHostKeyChecking yes
-          EOF
+        # Patch only a marked release block in the existing HTTPS server.
+        # All supplied locations and upstream names are preserved verbatim.
+        python3 - "$NGINX_CONF" "$candidate" <<'PY'
+        import re
+        import sys
+        from pathlib import Path
+        source, output = map(Path, sys.argv[1:])
+        text = source.read_text()
+        begin = '    # BEGIN GITHUB ACTIONS VLMS v50112'
+        end = '    # END GITHUB ACTIONS VLMS v50112'
+        routes = '''    # BEGIN GITHUB ACTIONS VLMS v50112
+            location /v50112/AIExecution/ {
+                proxy_pass http://ai_exe_sad-v50112:4010/;
+                include /etc/nginx/proxy-params.conf;
+            }
 
-      - name: Check server prerequisites and create directory
-        shell: bash
-        run: |
-          set -euo pipefail
+            location /v50112/AIExecution/analyze-image {
+                proxy_pass http://ai_exe_sad-v5.0.1.1.2:4010/analyze-image;
+                include /etc/nginx/proxy-params.conf;
+                proxy_connect_timeout 300s;
+            }
 
-          ssh vlms-target 'bash -se' <<'REMOTE'
-          set -euo pipefail
+            location /v50112/AIContentGeneration/ {
+                proxy_pass http://ai_content_generation-v5.0.1.1.2:4000/;
+                include /etc/nginx/proxy-params.conf;
+            }
 
-          command -v az >/dev/null
-          command -v docker >/dev/null
-          command -v rsync >/dev/null
+            location /v50112/AISmartGapAssessor/ {
+                proxy_pass http://ai_sga-v5.0.1.1.2:8080/api/;
+                include /etc/nginx/proxy-params.conf;
+            }
 
-          docker compose version
-          docker info >/dev/null
+            location /v50112/AISmartAuthor/ {
+                proxy_pass http://ai_smart_generation-v5.0.1.1.2:8000/;
+                proxy_read_timeout 300s;
+                include /etc/nginx/proxy-params.conf;
+            }
+            # END GITHUB ACTIONS VLMS v50112'''
+        if text.count(begin) != text.count(end) or text.count(begin) > 1:
+            raise SystemExit('Ambiguous Nginx deployment markers; no changes made.')
+        if begin in text:
+            first, last = text.index(begin), text.index(end) + len(end)
+            if last < first:
+                raise SystemExit('Invalid deployment marker order.')
+            outside = text[:first] + text[last:]
+            if re.search(r'^\s*location\s+[^\n{]*/v50112/', outside, re.M):
+                raise SystemExit('Unmanaged /v50112/ locations already exist; no changes made.')
+            patched = text[:first] + routes + text[last:]
+        else:
+            if re.search(r'^\s*location\s+[^\n{]*/v50112/', text, re.M):
+                raise SystemExit('Existing /v50112/ routes have no deployment markers; no changes made. Add markers around the existing release block first.')
+            anchor = '    error_page 404 /index.html;'
+            if text.count(anchor) != 1:
+                raise SystemExit('Expected one error_page insertion point; no changes made.')
+            patched = text.replace(anchor, routes + '\n\n' + anchor, 1)
+        output.write_text(patched)
+        PY
 
-          mkdir -p /home/vgadmin/VLMS/v5.0.1.1.2
-          REMOTE
+        # Read the DNS from the current configuration instead of hardcoding it.
+        DNS=$(python3 - "$NGINX_CONF" <<'PY'
+        import re, sys
+        from pathlib import Path
+        text = re.sub(r'#[^\n]*', '', Path(sys.argv[1]).read_text())
+        names = re.findall(r'\bserver_name\s+([^;]+);', text)
+        hosts = {name for group in names for name in group.split()
+                 if name != '_' and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]*', name)}
+        if len(hosts) != 1:
+            raise SystemExit('Expected one DNS hostname in nginx.conf; found multiple or none.')
+        print(hosts.pop())
+        PY
+        )
 
-      - name: Copy deployment files
-        shell: bash
-        run: |
-          set -euo pipefail
+        cp -p "$NGINX_CONF" "$backup"
+        changed=true
+        # Do not replace the inode: Docker mounts this individual file.
+        cat "$candidate" > "$NGINX_CONF"
+        docker exec "$NGINX_CONTAINER" nginx -t
+        docker restart "$NGINX_CONTAINER"
 
-          rsync -az \
-            --exclude='.env' \
-            --exclude='.env.*' \
-            "$SOURCE_DIR/" \
-            "vlms-target:$DEPLOY_DIR/"
+        nginx_ready=false
+        for attempt in {1..15}; do
+          if [ "$(docker inspect --format '{{.State.Running}}' "$NGINX_CONTAINER" 2>/dev/null)" = true ] &&
+             docker exec "$NGINX_CONTAINER" nginx -t; then
+            nginx_ready=true
+            break
+          fi
+          sleep 2
+        done
+        "$nginx_ready" || { echo 'Nginx did not restart successfully.'; false; }
 
-      - name: Authenticate and start deployment
-        shell: bash
-        run: |
-          set -euo pipefail
+        # Preserve the requested readiness paths. Correct only the missing slash
+        # between the DNS and the final path. Redirects are NOT counted as ready.
+        paths=(
+          /v5.0.1.0.40/AIChatBot/ready
+          /v5.0.1.1.2/AIContentGeneration/ready
+          /v5.0.1.1.2/AISmartAuthor/ready
+          /v5.0.1.1.2/AIExecution/ready
+          /v5.0.1.1.2/AISmartGapAssessor/ready
+        )
+        failed=0
+        for path in "${paths[@]}"; do
+          url="https://${DNS}${path}"
+          passed=false
+          for attempt in {1..12}; do
+            code=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+              --connect-timeout 5 --max-time 10 "$url") || code=000
+            if [ "$code" = 200 ]; then passed=true; break; fi
+            sleep 3
+          done
+          echo "$url -> HTTP $code"
+          if ! "$passed"; then failed=1; fi
+        done
+        if [ "$failed" -ne 0 ]; then
+          echo 'Readiness failed: verify routes, DNS/TLS, authentication, and application readiness.'
+          false
+        fi
 
-          ssh vlms-target "bash -se -- '$ACR_NAME'" <<'REMOTE'
-          set -euo pipefail
-
-          ACR_NAME="$1"
-          cd /home/vgadmin/VLMS/v5.0.1.1.2
-
-          # Make all deployment shell scripts executable.
-          find . -type f -name '*.sh' -exec chmod +x {} +
-
-          # Authenticate on the Azure VM using its managed identity.
-          az login --identity --output none
-          az acr login --name "$ACR_NAME"
-
-          # Run in the deployment directory.
-          ./start.sh
-          REMOTE
-
-      - name: Remove SSH credentials from runner
-        if: always()
-        shell: bash
-        run: |
-          rm -f "$HOME/.ssh/deploy_key" \
-                "$HOME/.ssh/config" \
-                "$HOME/.ssh/known_hosts"
+        echo "Deployment and HTTP readiness checks passed. Nginx backup: $backup"
+        REMOTE
+    - name: Remove SSH credentials
+      if: always()
+      shell: bash
+      run: |
+        rm -f "$HOME/.ssh/deploy_key" "$HOME/.ssh/config" "$HOME/.ssh/known_hosts"
