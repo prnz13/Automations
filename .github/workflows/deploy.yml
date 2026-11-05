@@ -1,4 +1,4 @@
-# Preserve the supplied /v50112/ locations and upstream names.
+# Only the five release locations are read from vars.NGINX_CONF_CONTENT.
 # Readiness URLs intentionally retain the supplied dotted version paths.
 # DronaAKS is not included: its Compose file has not been supplied.
 name: Deploy VLMS to Azure Ubuntu
@@ -143,6 +143,32 @@ jobs:
                 os.unlink(temporary)
         '"'"''
         echo '.env transferred with permissions 600.'
+    - name: Transfer Nginx location blocks from GitHub Variables
+      shell: bash
+      env:
+        NGINX_CONF_CONTENT: ${{ vars.NGINX_CONF_CONTENT }}
+      run: |
+        set -euo pipefail
+        test -n "$NGINX_CONF_CONTENT" || { echo 'Missing repository variable: NGINX_CONF_CONTENT'; exit 1; }
+        # Pass configuration as data: Nginx $variables remain literal.
+        printf '%s\n' "$NGINX_CONF_CONTENT" |
+          ssh vlms-target 'python3 -c '"'"'import os, sys, tempfile
+        from pathlib import Path
+        os.umask(0o077)
+        target = Path("/home/vgadmin/VLMS/v5.0.1.1.2/.nginx-config.pending")
+        data = sys.stdin.buffer.read()
+        if not data.strip():
+            raise SystemExit("NGINX_CONF_CONTENT is empty")
+        fd, temporary = tempfile.mkstemp(prefix=".nginx-config.", dir=target.parent)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+            os.replace(temporary, target)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        '"'"''
+        echo 'Nginx location blocks transferred from GitHub Variables.'
     - name: Deploy, update Nginx, and verify readiness
       shell: bash
       run: |
@@ -198,94 +224,113 @@ jobs:
         done
         ./ai-start.sh
 
-        # Check API containers AND background workers, using one bounded retry window.
-        containers=(
-          ai_content_generation-v5.0.1.1.2
-          ai_exe_sad-v5.0.1.1.2
-          ai_ingestion-v5.0.1.1.2
-          ai_sga-v5.0.1.1.2
-          ai_sga-celery-v5.0.1.1.2
-          ai_smart_generation-v5.0.1.1.2
-          ai_smart_generation_worker-v5.0.1.1.2
-        )
-        all_ready=false
-        for attempt in {1..30}; do
-          all_ready=true
-          for container in "${containers[@]}"; do
-            status=$(docker inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}not-configured{{end}}' "$container" 2>/dev/null) || status=missing
-            case "$status" in
-              'running|healthy'|'running|not-configured') ;;
-              *) all_ready=false ;;
-            esac
-          done
-          if "$all_ready"; then break; fi
-          sleep 5
-        done
-        for container in "${containers[@]}"; do
-          docker inspect --format '{{.Name}}: {{.State.Status}}; health={{if .State.Health}}{{.State.Health.Status}}{{else}}not-configured{{end}}' "$container" || true
-        done
-        "$all_ready" || { echo 'Container startup/health checks failed.'; false; }
-
-        # Patch only a marked release block in the existing HTTPS server.
-        # All supplied locations and upstream names are preserved verbatim.
-        python3 - "$NGINX_CONF" "$candidate" <<'PY'
+        # Merge only the five location blocks into the existing HTTPS server.
+        test -s .nginx-config.pending || { echo 'Staged NGINX_CONF_CONTENT is missing.'; false; }
+        python3 - "$NGINX_CONF" .nginx-config.pending "$candidate" <<'PY'
         import re
         import sys
         from pathlib import Path
-        source, output = map(Path, sys.argv[1:])
+        
+        source, snippets, output = map(Path, sys.argv[1:])
         text = source.read_text()
+        blocks = snippets.read_text().strip()
+        
+        # Ignore comments and quoted strings when locating structural braces.
+        def mask(value):
+            pattern = r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\#[^\n]*'''
+            return re.sub(pattern, lambda m: ''.join('\n' if c == '\n' else ' ' for c in m.group()), value)
+        
+        def close_brace(value, opening):
+            depth = 0
+            for pos in range(opening, len(value)):
+                if value[pos] == '{':
+                    depth += 1
+                elif value[pos] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        return pos
+            raise SystemExit('Unbalanced Nginx braces; no changes made.')
+        
+        masked_blocks = mask(blocks)
+        locations = []
+        position = 0
+        while position < len(blocks):
+            match = re.search(r'\S', masked_blocks[position:])
+            if not match:
+                break
+            first = position + match.start()
+            location = re.match(r'location\s+(/v50112/[^\s{]+)\s*\{', masked_blocks[first:])
+            if not location:
+                raise SystemExit('NGINX_CONF_CONTENT must contain only /v50112/ location blocks, not a complete configuration.')
+            opening = first + location.end() - 1
+            last = close_brace(masked_blocks, opening) + 1
+            locations.append((location.group(1), blocks[first:last]))
+            position = last
+        expected = {
+            '/v50112/AIExecution/',
+            '/v50112/AIExecution/analyze-image',
+            '/v50112/AIContentGeneration/',
+            '/v50112/AISmartGapAssessor/',
+            '/v50112/AISmartAuthor/',
+        }
+        if len(locations) != 5 or {path for path, _ in locations} != expected:
+            raise SystemExit('Variable must contain exactly the five requested /v50112/ location blocks.')
+        
+        masked = mask(text)
+        servers = []
+        for match in re.finditer(r'\bserver\s*\{', masked):
+            opening = match.end() - 1
+            closing = close_brace(masked, opening)
+            body = masked[opening+1:closing]
+            if re.search(r'\blisten\s+(?:\[::\]:|[0-9.]+:)?443\b', body):
+                servers.append((opening, closing))
+        if len(servers) != 1:
+            raise SystemExit('Expected exactly one HTTPS server block; no changes made.')
+        opening, closing = servers[0]
+        body = text[opening+1:closing]
+        
+        # Support the release markers used by earlier workflow versions.
         begin = '    # BEGIN GITHUB ACTIONS VLMS v50112'
         end = '    # END GITHUB ACTIONS VLMS v50112'
-        routes = '''    # BEGIN GITHUB ACTIONS VLMS v50112
-            location /v50112/AIExecution/ {
-                proxy_pass http://ai_exe_sad-v50112:4010/;
-                include /etc/nginx/proxy-params.conf;
-            }
-
-            location /v50112/AIExecution/analyze-image {
-                proxy_pass http://ai_exe_sad-v5.0.1.1.2:4010/analyze-image;
-                include /etc/nginx/proxy-params.conf;
-                proxy_connect_timeout 300s;
-            }
-
-            location /v50112/AIContentGeneration/ {
-                proxy_pass http://ai_content_generation-v5.0.1.1.2:4000/;
-                include /etc/nginx/proxy-params.conf;
-            }
-
-            location /v50112/AISmartGapAssessor/ {
-                proxy_pass http://ai_sga-v5.0.1.1.2:8080/api/;
-                include /etc/nginx/proxy-params.conf;
-            }
-
-            location /v50112/AISmartAuthor/ {
-                proxy_pass http://ai_smart_generation-v5.0.1.1.2:8000/;
-                proxy_read_timeout 300s;
-                include /etc/nginx/proxy-params.conf;
-            }
-            # END GITHUB ACTIONS VLMS v50112'''
         if text.count(begin) != text.count(end) or text.count(begin) > 1:
-            raise SystemExit('Ambiguous Nginx deployment markers; no changes made.')
+            raise SystemExit('Ambiguous release markers; no changes made.')
         if begin in text:
-            first, last = text.index(begin), text.index(end) + len(end)
-            if last < first:
-                raise SystemExit('Invalid deployment marker order.')
-            outside = text[:first] + text[last:]
-            if re.search(r'^\s*location\s+[^\n{]*/v50112/', outside, re.M):
-                raise SystemExit('Unmanaged /v50112/ locations already exist; no changes made.')
-            patched = text[:first] + routes + text[last:]
+            if begin not in body or end not in body or body.index(end) < body.index(begin):
+                raise SystemExit('Release markers must be inside the HTTPS server.')
+            first, last = body.index(begin), body.index(end)+len(end)
+            replacement = begin+'\n'+'\n\n'.join('    '+block for _, block in locations)+'\n'+end
+            outside = body[:first]+body[last:]
+            if re.search(r'\blocation\s+/v50112/', mask(outside)):
+                raise SystemExit('Duplicate unmanaged release locations; no changes made.')
+            new_body = body[:first]+replacement+body[last:]
         else:
-            if re.search(r'^\s*location\s+[^\n{]*/v50112/', text, re.M):
-                raise SystemExit('Existing /v50112/ routes have no deployment markers; no changes made. Add markers around the existing release block first.')
-            anchor = '    error_page 404 /index.html;'
-            if text.count(anchor) != 1:
-                raise SystemExit('Expected one error_page insertion point; no changes made.')
-            patched = text.replace(anchor, routes + '\n\n' + anchor, 1)
-        output.write_text(patched)
+            masked_body = mask(body)
+            edits = []
+            missing = []
+            for path, block in locations:
+                matches = list(re.finditer(r'\blocation\s+'+re.escape(path)+r'\s*\{', masked_body))
+                if len(matches) > 1:
+                    raise SystemExit('Duplicate existing location: '+path)
+                if matches:
+                    match = matches[0]
+                    last = close_brace(masked_body, match.end()-1)+1
+                    edits.append((match.start(), last, block))
+                else:
+                    missing.append('    '+block)
+            if missing:
+                anchor = re.search(r'(?m)^\s*error_page\s+404\s+/index\.html;', masked_body)
+                insertion = anchor.start() if anchor else len(body)
+                edits.append((insertion, insertion, '\n'+'\n\n'.join(missing)+'\n\n'))
+            new_body = body
+            for first, last, replacement in sorted(edits, reverse=True):
+                new_body = new_body[:first]+replacement+new_body[last:]
+        
+        output.write_text(text[:opening+1]+new_body+text[closing:])
         PY
-
+        rm -f .nginx-config.pending
+        
         # Read the DNS from the current configuration instead of hardcoding it.
-        DNS=$(python3 - "$NGINX_CONF" <<'PY'
+        DNS=$(python3 - "$candidate" <<'PY'
         import re, sys
         from pathlib import Path
         text = re.sub(r'#[^\n]*', '', Path(sys.argv[1]).read_text())
@@ -315,6 +360,34 @@ jobs:
           sleep 2
         done
         "$nginx_ready" || { echo 'Nginx did not restart successfully.'; false; }
+
+        # Check API containers AND background workers, using one bounded retry window.
+        containers=(
+          ai_content_generation-v5.0.1.1.2
+          ai_exe_sad-v5.0.1.1.2
+          ai_ingestion-v5.0.1.1.2
+          ai_sga-v5.0.1.1.2
+          ai_sga-celery-v5.0.1.1.2
+          ai_smart_generation-v5.0.1.1.2
+          ai_smart_generation_worker-v5.0.1.1.2
+        )
+        all_ready=false
+        for attempt in {1..30}; do
+          all_ready=true
+          for container in "${containers[@]}"; do
+            status=$(docker inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}not-configured{{end}}' "$container" 2>/dev/null) || status=missing
+            case "$status" in
+              'running|healthy'|'running|not-configured') ;;
+              *) all_ready=false ;;
+            esac
+          done
+          if "$all_ready"; then break; fi
+          sleep 5
+        done
+        for container in "${containers[@]}"; do
+          docker inspect --format '{{.Name}}: {{.State.Status}}; health={{if .State.Health}}{{.State.Health.Status}}{{else}}not-configured{{end}}' "$container" || true
+        done
+        "$all_ready" || { echo 'Container startup/health checks failed.'; false; }
 
         # Preserve the requested readiness paths. Correct only the missing slash
         # between the DNS and the final path. Redirects are NOT counted as ready.
