@@ -361,38 +361,9 @@ jobs:
         done
         "$nginx_ready" || { echo 'Nginx did not restart successfully.'; false; }
 
-        # Check API containers AND background workers, using one bounded retry window.
-        containers=(
-          ai_content_generation-v5.0.1.1.2
-          ai_exe_sad-v5.0.1.1.2
-          ai_ingestion-v5.0.1.1.2
-          ai_sga-v5.0.1.1.2
-          ai_sga-celery-v5.0.1.1.2
-          ai_smart_generation-v5.0.1.1.2
-          ai_smart_generation_worker-v5.0.1.1.2
-        )
-        all_ready=false
-        for attempt in {1..30}; do
-          all_ready=true
-          for container in "${containers[@]}"; do
-            status=$(docker inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}not-configured{{end}}' "$container" 2>/dev/null) || status=missing
-            case "$status" in
-              'running|healthy'|'running|not-configured') ;;
-              *) all_ready=false ;;
-            esac
-          done
-          if "$all_ready"; then break; fi
-          sleep 5
-        done
-        for container in "${containers[@]}"; do
-          docker inspect --format '{{.Name}}: {{.State.Status}}; health={{if .State.Health}}{{.State.Health.Status}}{{else}}not-configured{{end}}' "$container" || true
-        done
-        "$all_ready" || { echo 'Container startup/health checks failed.'; false; }
-
-        # Preserve the requested readiness paths. Correct only the missing slash
-        # between the DNS and the final path. Redirects are NOT counted as ready.
+        # Verify only the four requested application readiness URLs.
+        # DNS comes from nginx.conf. Redirects are NOT counted as ready.
         paths=(
-          /v5.0.1.0.40/AIChatBot/ready
           /v5.0.1.1.2/AIContentGeneration/ready
           /v5.0.1.1.2/AISmartAuthor/ready
           /v5.0.1.1.2/AIExecution/ready
