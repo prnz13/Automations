@@ -361,6 +361,9 @@ jobs:
         done
         "$nginx_ready" || { echo 'Nginx did not restart successfully.'; false; }
 
+        echo 'Nginx restarted successfully. Waiting 60 seconds before readiness checks.'
+        sleep 60
+
         # Verify only the four requested application readiness URLs.
         # DNS comes from nginx.conf. Redirects are NOT counted as ready.
         paths=(
