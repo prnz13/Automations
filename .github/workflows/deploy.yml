@@ -259,22 +259,22 @@ jobs:
             if not match:
                 break
             first = position + match.start()
-            location = re.match(r'location\s+(/v50112/[^\s{]+)\s*\{', masked_blocks[first:])
+            location = re.match(r'location\s+(/v5\.0\.1\.1\.2/[^\s{]+)\s*\{', masked_blocks[first:])
             if not location:
-                raise SystemExit('NGINX_CONF_CONTENT must contain only /v50112/ location blocks, not a complete configuration.')
+                raise SystemExit('NGINX_CONF_CONTENT must contain only /v5.0.1.1.2/ location blocks, not a complete configuration.')
             opening = first + location.end() - 1
             last = close_brace(masked_blocks, opening) + 1
             locations.append((location.group(1), blocks[first:last]))
             position = last
         expected = {
-            '/v50112/AIExecution/',
-            '/v50112/AIExecution/analyze-image',
-            '/v50112/AIContentGeneration/',
-            '/v50112/AISmartGapAssessor/',
-            '/v50112/AISmartAuthor/',
+            '/v5.0.1.1.2/AIExecution/',
+            '/v5.0.1.1.2/AIExecution/analyze-image',
+            '/v5.0.1.1.2/AIContentGeneration/',
+            '/v5.0.1.1.2/AISmartGapAssessor/',
+            '/v5.0.1.1.2/AISmartAuthor/',
         }
         if len(locations) != 5 or {path for path, _ in locations} != expected:
-            raise SystemExit('Variable must contain exactly the five requested /v50112/ location blocks.')
+            raise SystemExit('Variable must contain exactly the five requested /v5.0.1.1.2/ location blocks.')
         
         masked = mask(text)
         servers = []
@@ -300,7 +300,7 @@ jobs:
             first, last = body.index(begin), body.index(end)+len(end)
             replacement = begin+'\n'+'\n\n'.join('    '+block for _, block in locations)+'\n'+end
             outside = body[:first]+body[last:]
-            if re.search(r'\blocation\s+/v50112/', mask(outside)):
+            if re.search(r'\blocation\s+/v5\.0\.1\.1\.2/', mask(outside)):
                 raise SystemExit('Duplicate unmanaged release locations; no changes made.')
             new_body = body[:first]+replacement+body[last:]
         else:
