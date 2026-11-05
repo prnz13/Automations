@@ -1,4 +1,4 @@
-# VLMS deployment to Azure Ubuntu with GitHub Actions
+# VLMS AI deployment to Azure Ubuntu servers with GitHub Actions
 
 Deploy release **v5.0.1.1.2** from the **Automations** repository to an existing Azure Ubuntu VM. The workflow transfers deployment files and a secret-backed `.env`, authenticates to Azure Container Registry, runs `ai-start.sh`, merges five Nginx location blocks, restarts Nginx, waits 60 seconds, and checks four HTTPS readiness endpoints.
 
