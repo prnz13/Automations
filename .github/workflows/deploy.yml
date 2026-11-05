@@ -367,10 +367,10 @@ jobs:
         # Verify only the four requested application readiness URLs.
         # DNS comes from nginx.conf. Redirects are NOT counted as ready.
         paths=(
-          /v5.0.1.1.2/AIContentGeneration/ready
-          /v5.0.1.1.2/AISmartAuthor/ready
-          /v5.0.1.1.2/AIExecution/ready
-          /v5.0.1.1.2/AISmartGapAssessor/ready
+          /v5.0.1.1.2/AIContentGeneration/health
+          /v5.0.1.1.2/AISmartAuthor/health
+          /v5.0.1.1.2/AIExecution/health
+          /v5.0.1.1.2/AISmartGapAssessor/health
         )
         failed=0
         for path in "${paths[@]}"; do
