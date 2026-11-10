@@ -252,8 +252,10 @@ jobs:
         echo 'All image pulls completed. Starting application containers.'
         bash -e -o pipefail ./ai-start.sh
         
-        # Phase 4: Verify all configured services exist, are running on ai_net,
-        # use the downloaded images, and resolve from Nginx. Ignore Docker Health status.
+        # Phase 4: Verify configured services and release upstream DNS.
+        # Only ai_ingestion-v5.0.1.1.2 may restart while Key Vault is being updated.
+        # Missing ingestion, wrong images, and other service failures still block deployment.
+        # Docker Health status remains ignored.
         # Up to 180 seconds are allowed for startup/Docker DNS; Nginx is unchanged here.
         test -s .nginx-config.pending || { echo 'Staged NGINX_CONF_CONTENT is missing.'; false; }
         python3 - "$containers_plan" .nginx-config.pending <<'STARTUP_PY'
@@ -292,8 +294,10 @@ jobs:
         deadline = time.monotonic() + 180
         stable_samples = 0
         last_issues = None
+        reported_ingestion_restart = False
         while True:
             issues = []
+            allowed_restarting = set()
             for project, service, container, image_id in expected:
                 result = subprocess.run(['docker', 'inspect', container], capture_output=True, text=True)
                 if result.returncode != 0:
@@ -304,13 +308,22 @@ jobs:
                     state = info.get('State', {})
                     networks = info.get('NetworkSettings', {}).get('Networks', {})
                     labels = info.get('Config', {}).get('Labels') or {}
-                    if state.get('Status') != 'running' or state.get('Restarting'):
+                    allow_restart = (
+                        container == 'ai_ingestion-v5.0.1.1.2'
+                        and (state.get('Status') == 'restarting' or state.get('Restarting'))
+                    )
+                    if allow_restart:
+                        allowed_restarting.add(container)
+                        if not reported_ingestion_restart:
+                            print('WARNING: ' + container + ': restarting is permitted while Azure Key Vault is being updated; ingestion is not confirmed ready.', flush=True)
+                            reported_ingestion_restart = True
+                    if (state.get('Status') != 'running' or state.get('Restarting')) and not allow_restart:
                         issues.append(container + ': state=' + str(state.get('Status')))
                     elif info.get('Image') != image_id:
                         issues.append(container + ': not using the image currently downloaded for this release')
                     elif labels.get('com.docker.compose.project') != project or labels.get('com.docker.compose.service') != service:
                         issues.append(container + ': Compose project/service does not match the deployment plan')
-                    elif 'ai_net' not in networks or not networks['ai_net'].get('IPAddress'):
+                    elif not allow_restart and ('ai_net' not in networks or not networks['ai_net'].get('IPAddress')):
                         issues.append(container + ': not attached to ai_net with an IPv4 address')
                 except (ValueError, IndexError, TypeError, AttributeError):
                     issues.append(container + ': unable to read container inspection result')
@@ -333,8 +346,11 @@ jobs:
                 stable_samples += 1
                 if stable_samples >= 3:
                     for _, _, container, _ in expected:
-                        print(container + ': running; downloaded image confirmed; ai_net attached')
-                    print('All configured application containers are running and Nginx resolves every release upstream.')
+                        if container in allowed_restarting:
+                            print(container + ': restarting permitted; downloaded image and Compose identity confirmed; network check deferred')
+                        else:
+                            print(container + ': running; downloaded image confirmed; ai_net attached')
+                    print('Required startup checks passed; Nginx resolves every release upstream. Ingestion restarting is permitted pending Key Vault configuration.')
                     break
             if time.monotonic() >= deadline:
                 raise SystemExit('Container startup/network verification timed out. Nginx configuration has NOT been changed. Review the first pull/start error and docker compose ps -a.')
