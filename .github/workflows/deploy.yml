@@ -81,6 +81,7 @@ jobs:
         [ "$(docker inspect --format '{{.State.Running}}' ai_nginx)" = true ]
         docker inspect --format '{{json .NetworkSettings.Networks}}' ai_nginx |
           python3 -c 'import json,sys; assert "ai_net" in json.load(sys.stdin), "ai_nginx must be connected to ai_net"'
+        docker exec ai_nginx sh -c 'command -v getent >/dev/null'
         docker exec ai_nginx nginx -t
         mkdir -p /home/vgadmin/VLMS/v5.0.1.1.2
         REMOTE
@@ -185,9 +186,10 @@ jobs:
         NGINX_CONF=/home/vgadmin/Common-AI/nginx/nginx.conf
         backup="${NGINX_CONF}.backup.$(date -u +%Y%m%dT%H%M%SZ).$$"
         candidate=$(mktemp)
+        containers_plan=$(mktemp)
         changed=false
 
-        cleanup() { rm -f "$candidate"; }
+        cleanup() { rm -f "$candidate" "$containers_plan"; }
         recover() {
           result=$?
           trap - ERR
@@ -216,13 +218,130 @@ jobs:
         # Azure login was completed by the service-principal step.
         az acr login --name "$1"
 
-        # Validate every Compose file before any service is started.
+        # Phase 1: Validate all Compose files and record every configured service.
         projects=(ai-service-cg-v50112 ai-service-ea-v50112 ai-service-ing-v50112 ai-service-sga-v50112 ai-service-sg-v50112)
         files=(content-generation-docker-compose.yaml execution-assisstant-docker-compose.yaml ingestion-docker-compose.yaml sga-docker-compose.yaml smart-generation-docker-compose.yaml)
         for i in "${!files[@]}"; do
           docker compose --env-file .env -p "${projects[$i]}" -f "${files[$i]}" config --quiet
+          docker compose --env-file .env -p "${projects[$i]}" -f "${files[$i]}" config --format json |
+            python3 -c 'import json, sys
+        project = sys.argv[1]
+        services = json.load(sys.stdin).get("services", {})
+        if not services:
+            raise SystemExit("No services found: " + project)
+        for service, config in services.items():
+            container = config.get("container_name")
+            image = config.get("image")
+            if not container or not image:
+                raise SystemExit("Every deployed service must define container_name and image: " + service)
+            if config.get("profiles"):
+                raise SystemExit("Profile-specific services need explicit deployment configuration: " + service)
+            print("\t".join((project, service, container, image)))' "${projects[$i]}" >> "$containers_plan"
         done
-        ./ai-start.sh
+        
+        # Phase 2: Finish ALL image downloads/extraction before starting deployment.
+        # A failed pull stops the job; no new Nginx configuration is applied.
+        for i in "${!files[@]}"; do
+          echo "Pulling all images for ${files[$i]}"
+          docker compose --env-file .env -p "${projects[$i]}" -f "${files[$i]}" pull
+          echo "Image download completed: ${files[$i]}"
+        done
+        
+        # Phase 3: Run the existing entrypoint with mandatory fail-fast behavior.
+        # An internal Compose failure must not be hidden by later successful commands.
+        echo 'All image pulls completed. Starting application containers.'
+        bash -e -o pipefail ./ai-start.sh
+        
+        # Phase 4: Verify all configured services exist, are running on ai_net,
+        # use the downloaded images, and resolve from Nginx. Ignore Docker Health status.
+        # Up to 180 seconds are allowed for startup/Docker DNS; Nginx is unchanged here.
+        test -s .nginx-config.pending || { echo 'Staged NGINX_CONF_CONTENT is missing.'; false; }
+        python3 - "$containers_plan" .nginx-config.pending <<'STARTUP_PY'
+        import json
+        import re
+        import subprocess
+        import sys
+        import time
+        from pathlib import Path
+        
+        plan_path, nginx_fragment = map(Path, sys.argv[1:])
+        rows = [line.split('\t') for line in plan_path.read_text().splitlines() if line]
+        if not rows:
+            raise SystemExit('No application services found in the Compose deployment plan.')
+        
+        # Snapshot the image IDs that are now present locally after every pull succeeded.
+        expected = []
+        for project, service, container, image in rows:
+            result = subprocess.run(
+                ['docker', 'image', 'inspect', '--format', '{{.Id}}', image],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                raise SystemExit('Downloaded image is missing locally: ' + image)
+            expected.append((project, service, container, result.stdout.strip()))
+        
+        upstreams = sorted(set(re.findall(
+            r'\bproxy_pass\s+https?://([A-Za-z0-9_.-]+)(?=[:/;\s])',
+            re.sub(r'#[^\n]*', '', nginx_fragment.read_text()),
+        )))
+        if not upstreams:
+            raise SystemExit('No upstream hostnames found in the Nginx location fragment.')
+        
+        # This is a startup/network check, not a Docker HEALTHCHECK gate.
+        # Require three consecutive successful samples before Nginx can be changed.
+        deadline = time.monotonic() + 180
+        stable_samples = 0
+        last_issues = None
+        while True:
+            issues = []
+            for project, service, container, image_id in expected:
+                result = subprocess.run(['docker', 'inspect', container], capture_output=True, text=True)
+                if result.returncode != 0:
+                    issues.append(container + ': missing; inspect the preceding Compose startup output')
+                    continue
+                try:
+                    info = json.loads(result.stdout)[0]
+                    state = info.get('State', {})
+                    networks = info.get('NetworkSettings', {}).get('Networks', {})
+                    labels = info.get('Config', {}).get('Labels') or {}
+                    if state.get('Status') != 'running' or state.get('Restarting'):
+                        issues.append(container + ': state=' + str(state.get('Status')))
+                    elif info.get('Image') != image_id:
+                        issues.append(container + ': not using the image currently downloaded for this release')
+                    elif labels.get('com.docker.compose.project') != project or labels.get('com.docker.compose.service') != service:
+                        issues.append(container + ': Compose project/service does not match the deployment plan')
+                    elif 'ai_net' not in networks or not networks['ai_net'].get('IPAddress'):
+                        issues.append(container + ': not attached to ai_net with an IPv4 address')
+                except (ValueError, IndexError, TypeError, AttributeError):
+                    issues.append(container + ': unable to read container inspection result')
+            if not issues:
+                for host in upstreams:
+                    result = subprocess.run(
+                        ['docker', 'exec', 'ai_nginx', 'getent', 'hosts', host],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    if result.returncode != 0 or not result.stdout.strip():
+                        issues.append('Nginx cannot resolve upstream: ' + host)
+            if issues:
+                stable_samples = 0
+                if issues != last_issues:
+                    print('Waiting for application startup / Docker DNS:', flush=True)
+                    for issue in issues:
+                        print('  ' + issue, flush=True)
+                    last_issues = issues
+            else:
+                stable_samples += 1
+                if stable_samples >= 3:
+                    for _, _, container, _ in expected:
+                        print(container + ': running; downloaded image confirmed; ai_net attached')
+                    print('All configured application containers are running and Nginx resolves every release upstream.')
+                    break
+            if time.monotonic() >= deadline:
+                raise SystemExit('Container startup/network verification timed out. Nginx configuration has NOT been changed. Review the first pull/start error and docker compose ps -a.')
+            time.sleep(5)
+        STARTUP_PY
+        
+        # Phase 5: Only now may the Nginx merge, validation, and restart begin.
 
         # Merge only the five location blocks into the existing HTTPS server.
         test -s .nginx-config.pending || { echo 'Staged NGINX_CONF_CONTENT is missing.'; false; }
@@ -367,10 +486,10 @@ jobs:
         # Verify only the four requested application readiness URLs.
         # DNS comes from nginx.conf. Redirects are NOT counted as ready.
         paths=(
-          /v5.0.1.1.2/AIContentGeneration/health
-          /v5.0.1.1.2/AISmartAuthor/health
-          /v5.0.1.1.2/AIExecution/health
-          /v5.0.1.1.2/AISmartGapAssessor/health
+          /v5.0.1.1.2/AIContentGeneration/ready
+          /v5.0.1.1.2/AISmartAuthor/ready
+          /v5.0.1.1.2/AIExecution/ready
+          /v5.0.1.1.2/AISmartGapAssessor/ready
         )
         failed=0
         for path in "${paths[@]}"; do
